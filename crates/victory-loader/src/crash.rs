@@ -48,6 +48,9 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Serializes crash-log appends so concurrent threads never interleave lines.
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read before installing the exception handler.
 static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
@@ -79,6 +82,11 @@ pub fn log_crash(text: &str) {
 
 fn append_to_log(text: &str) {
     let Some(file) = LOG.get() else { return };
+    append_to_file(file, text);
+}
+
+fn append_to_file(file: &std::path::Path, text: &str) {
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ = append_record(file, text);
 }
 
@@ -1693,6 +1701,44 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn concurrent_crash_log_appends_do_not_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("crash.log");
+        let threads = 8usize;
+        let per_thread = 25usize;
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let log = &log;
+                s.spawn(move || {
+                    for i in 0..per_thread {
+                        append_to_file(
+                            log,
+                            &format!("thread {t} report {i}\n  line a\n  line b"),
+                        );
+                    }
+                });
+            }
+        });
+        let content = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), threads * per_thread * 4);
+        for chunk in lines.as_chunks::<4>().0 {
+            assert!(
+                chunk[0].starts_with("unix time "),
+                "unexpected header line: {:?}",
+                chunk[0]
+            );
+            assert!(
+                chunk[1].starts_with("thread ") && chunk[1].contains(" report "),
+                "unexpected report line: {:?}",
+                chunk[1]
+            );
+            assert_eq!(chunk[2], "  line a");
+            assert_eq!(chunk[3], "  line b");
         }
     }
 }
